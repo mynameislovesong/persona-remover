@@ -21,11 +21,12 @@ import {
   downloadBlob,
   drawImageToCanvas,
   eraseMatches,
+  findTemplateMatches,
   normalizeImage,
   prepareImageForOcr,
 } from './imageUtils'
-import { findMatches, type MatchMode } from './search'
-import type { BoundingBox, ImageItem, OcrWord } from './types'
+import { findMatches, mergeMatchBoxes, type MatchMode } from './search'
+import type { BoundingBox, ImageItem, MatchBox, OcrWord } from './types'
 
 const ACCEPTED = /\.(png|jpe?g|webp)$/i
 
@@ -71,7 +72,7 @@ function scaleBoundingBox(box: BoundingBox, scale: number): BoundingBox {
   }
 }
 
-function extractWords(data: unknown, coordinateScale = 1): OcrWord[] {
+function extractWords(data: unknown, coordinateScale = 1, pass = 'auto'): OcrWord[] {
   const shaped = data as { blocks?: TesseractBlockLike[]; words?: TesseractWordLike[] }
   const words: OcrWord[] = []
 
@@ -90,8 +91,8 @@ function extractWords(data: unknown, coordinateScale = 1): OcrWord[] {
           line.words?.forEach((word, wordIndex) => {
             if (!word.text?.trim() || !word.bbox) return
             words.push({
-              id: `${blockIndex}-${paragraphIndex}-${lineIndex}-${wordIndex}`,
-              lineId: `${blockIndex}-${paragraphIndex}-${lineIndex}`,
+              id: `${pass}-${blockIndex}-${paragraphIndex}-${lineIndex}-${wordIndex}`,
+              lineId: `${pass}-${blockIndex}-${paragraphIndex}-${lineIndex}`,
               text: word.text.trim(),
               confidence: word.confidence ?? 0,
               bbox: scaleBoundingBox(word.bbox, coordinateScale),
@@ -105,8 +106,8 @@ function extractWords(data: unknown, coordinateScale = 1): OcrWord[] {
     shaped.words.forEach((word, index) => {
       if (!word.text?.trim() || !word.bbox) return
       words.push({
-        id: `word-${index}`,
-        lineId: `fallback-${Math.round(word.bbox.y0 / (16 * Math.max(1, coordinateScale)))}`,
+        id: `${pass}-word-${index}`,
+        lineId: `${pass}-fallback-${Math.round(word.bbox.y0 / (16 * Math.max(1, coordinateScale)))}`,
         text: word.text.trim(),
         confidence: word.confidence ?? 0,
         bbox: scaleBoundingBox(word.bbox, coordinateScale),
@@ -115,6 +116,32 @@ function extractWords(data: unknown, coordinateScale = 1): OcrWord[] {
     })
   }
   return words
+}
+
+function ocrWordOverlap(a: OcrWord, b: OcrWord) {
+  const x0 = Math.max(a.bbox.x0, b.bbox.x0)
+  const y0 = Math.max(a.bbox.y0, b.bbox.y0)
+  const x1 = Math.min(a.bbox.x1, b.bbox.x1)
+  const y1 = Math.min(a.bbox.y1, b.bbox.y1)
+  if (x1 <= x0 || y1 <= y0) return 0
+  const intersection = (x1 - x0) * (y1 - y0)
+  const areaA = Math.max(1, (a.bbox.x1 - a.bbox.x0) * (a.bbox.y1 - a.bbox.y0))
+  const areaB = Math.max(1, (b.bbox.x1 - b.bbox.x0) * (b.bbox.y1 - b.bbox.y0))
+  return intersection / Math.min(areaA, areaB)
+}
+
+function mergeOcrWords(primary: OcrWord[], secondary: OcrWord[]) {
+  const merged = [...primary]
+  for (const candidate of secondary) {
+    const normalized = candidate.text.replace(/\s+/g, '').normalize('NFC').toLocaleLowerCase()
+    const duplicateIndex = merged.findIndex((existing) => {
+      const existingText = existing.text.replace(/\s+/g, '').normalize('NFC').toLocaleLowerCase()
+      return existingText === normalized && ocrWordOverlap(existing, candidate) > 0.72
+    })
+    if (duplicateIndex === -1) merged.push(candidate)
+    else if (candidate.confidence > merged[duplicateIndex].confidence) merged[duplicateIndex] = candidate
+  }
+  return merged
 }
 
 function App() {
@@ -131,12 +158,15 @@ function App() {
   const [notice, setNotice] = useState<string>()
   const [editingAll, setEditingAll] = useState(false)
   const [zipping, setZipping] = useState(false)
+  const [templateMatchesById, setTemplateMatchesById] = useState<Record<string, MatchBox[]>>({})
+  const [templateBusyId, setTemplateBusyId] = useState<string>()
   const fileInputRef = useRef<HTMLInputElement>(null)
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const itemsRef = useRef<ImageItem[]>([])
   const workerRef = useRef<Promise<Worker> | null>(null)
   const ocrBusyRef = useRef(false)
   const ocrImageIdRef = useRef<string | undefined>(undefined)
+  const ocrPassRef = useRef(1)
 
   const replaceItems = useCallback((updater: (current: ImageItem[]) => ImageItem[]) => {
     setItems((current) => {
@@ -158,7 +188,9 @@ function App() {
       workerRef.current = createWorker(['kor', 'eng'], OEM.LSTM_ONLY, {
         logger(message) {
           if (message.status !== 'recognizing text' || !ocrImageIdRef.current) return
-          updateItem(ocrImageIdRef.current, { progress: Math.round((message.progress ?? 0) * 100) })
+          const passOffset = ocrPassRef.current === 2 ? 0.5 : 0
+          const progress = Math.round((passOffset + (message.progress ?? 0) * 0.5) * 100)
+          updateItem(ocrImageIdRef.current, { progress })
         },
       }).then(async (worker) => {
         await worker.setParameters({ tessedit_pageseg_mode: PSM.AUTO })
@@ -173,14 +205,27 @@ function App() {
     if (!queued || ocrBusyRef.current) return
     ocrBusyRef.current = true
     ocrImageIdRef.current = queued.id
+    ocrPassRef.current = 1
     updateItem(queued.id, { status: 'ocr', progress: 0, error: undefined })
 
     void (async () => {
       try {
         const worker = await getWorker()
         const prepared = await prepareImageForOcr(queued.sourceUrl)
-        const result = await worker.recognize(prepared.blob, {}, { blocks: true })
-        const words = extractWords(result.data, prepared.scale)
+
+        ocrPassRef.current = 1
+        await worker.setParameters({ tessedit_pageseg_mode: PSM.AUTO })
+        const autoResult = await worker.recognize(prepared.blob, {}, { blocks: true })
+        const autoWords = extractWords(autoResult.data, prepared.scale, 'auto')
+
+        ocrPassRef.current = 2
+        updateItem(queued.id, { progress: 50 })
+        await worker.setParameters({ tessedit_pageseg_mode: PSM.SPARSE_TEXT })
+        const sparseResult = await worker.recognize(prepared.blob, {}, { blocks: true })
+        const sparseWords = extractWords(sparseResult.data, prepared.scale, 'sparse')
+
+        await worker.setParameters({ tessedit_pageseg_mode: PSM.AUTO })
+        const words = mergeOcrWords(autoWords, sparseWords)
         updateItem(queued.id, { status: 'detected', progress: 100, words })
       } catch (error) {
         const message = error instanceof Error ? error.message : '알 수 없는 OCR 오류'
@@ -191,6 +236,7 @@ function App() {
       } finally {
         ocrImageIdRef.current = undefined
         ocrBusyRef.current = false
+        ocrPassRef.current = 1
         setItems((current) => [...current])
       }
     })()
@@ -208,9 +254,14 @@ function App() {
   )
 
   const activeItem = items.find((item) => item.id === activeId) ?? items[0]
-  const activeMatches = useMemo(
+  const baseActiveMatches = useMemo(
     () => findMatches(activeItem?.words ?? [], query, matchMode),
     [activeItem?.words, matchMode, query],
+  )
+  const activeTemplateMatches = activeItem ? templateMatchesById[activeItem.id] ?? [] : []
+  const activeMatches = useMemo(
+    () => mergeMatchBoxes(baseActiveMatches, activeTemplateMatches),
+    [activeTemplateMatches, baseActiveMatches],
   )
   const selectedMatches = useMemo(
     () => activeMatches.filter((match) => !activeItem?.excludedMatchIds.includes(match.id)),
@@ -220,6 +271,56 @@ function App() {
   const matchesFor = useCallback(
     (item: ImageItem) => findMatches(item.words, query, matchMode),
     [matchMode, query],
+  )
+
+  useEffect(() => {
+    setTemplateMatchesById({})
+    setTemplateBusyId(undefined)
+  }, [matchMode, query])
+
+  useEffect(() => {
+    if (!activeItem || (activeItem.status !== 'detected' && activeItem.status !== 'edited')) return
+    if (query.replace(/\s+/g, '').length < 2 || !baseActiveMatches.length) return
+
+    let cancelled = false
+    const itemId = activeItem.id
+    const timer = window.setTimeout(() => {
+      setTemplateBusyId(itemId)
+      void findTemplateMatches(activeItem.sourceUrl, baseActiveMatches, baseActiveMatches)
+        .then((matches) => {
+          if (cancelled) return
+          setTemplateMatchesById((current) => ({ ...current, [itemId]: matches }))
+        })
+        .catch(() => {
+          if (!cancelled) setTemplateMatchesById((current) => ({ ...current, [itemId]: [] }))
+        })
+        .finally(() => {
+          if (!cancelled) setTemplateBusyId((current) => (current === itemId ? undefined : current))
+        })
+    }, 300)
+
+    return () => {
+      cancelled = true
+      window.clearTimeout(timer)
+    }
+  }, [activeItem?.id, activeItem?.sourceUrl, activeItem?.status, baseActiveMatches, query])
+
+  const matchesWithTemplatesFor = useCallback(
+    async (item: ImageItem) => {
+      const base = matchesFor(item)
+      if (!base.length) return base
+      let templates = templateMatchesById[item.id] ?? []
+      if (!templates.length && query.replace(/\s+/g, '').length >= 2) {
+        try {
+          templates = await findTemplateMatches(item.sourceUrl, base, base)
+          setTemplateMatchesById((current) => ({ ...current, [item.id]: templates }))
+        } catch {
+          templates = []
+        }
+      }
+      return mergeMatchBoxes(base, templates)
+    },
+    [matchesFor, query, templateMatchesById],
   )
 
   const invalidateResults = useCallback((preserveSelection = false) => {
@@ -325,7 +426,8 @@ function App() {
   }
 
   async function editItem(item: ImageItem) {
-    const matches = matchesFor(item).filter((match) => !item.excludedMatchIds.includes(match.id))
+    const allMatches = await matchesWithTemplatesFor(item)
+    const matches = allMatches.filter((match) => !item.excludedMatchIds.includes(match.id))
     if (!matches.length) return
     try {
       const blob = await eraseMatches(
@@ -370,6 +472,11 @@ function App() {
       URL.revokeObjectURL(target.sourceUrl)
       if (target.resultUrl) URL.revokeObjectURL(target.resultUrl)
     }
+    setTemplateMatchesById((current) => {
+      const next = { ...current }
+      delete next[id]
+      return next
+    })
     replaceItems((current) => current.filter((item) => item.id !== id))
     if (activeId === id) setActiveId(itemsRef.current.find((item) => item.id !== id)?.id)
   }
@@ -380,6 +487,8 @@ function App() {
       if (item.resultUrl) URL.revokeObjectURL(item.resultUrl)
     }
     replaceItems(() => [])
+    setTemplateMatchesById({})
+    setTemplateBusyId(undefined)
     setActiveId(undefined)
     setQuery('')
     setViewMode('before')
@@ -404,6 +513,8 @@ function App() {
   const ocrPosition = ocrItem ? items.findIndex((item) => item.id === ocrItem.id) + 1 : 0
   const completedCount = items.filter((item) => item.resultBlob).length
   const activeMatchCount = activeMatches.length
+  const templateCount = activeTemplateMatches.length
+  const templateSearching = Boolean(activeItem && templateBusyId === activeItem.id)
 
   return (
     <div className="app-shell">
@@ -524,7 +635,10 @@ function App() {
                   <button className={viewMode === 'after' ? 'active' : ''} type="button" disabled={!activeItem?.resultUrl} onClick={() => setViewMode('after')}>편집 결과</button>
                 </div>
                 <div className="detection-summary">
-                  <span className="dot" />{query ? `${activeMatchCount}개 검출 · ${selectedMatches.length}개 선택` : '이름을 입력해 주세요'}
+                  <span className="dot" />
+                  {query
+                    ? `${activeMatchCount}개 검출 · ${selectedMatches.length}개 선택${templateSearching ? ' · 이미지 보조 탐색 중…' : templateCount ? ` · 보조 ${templateCount}개` : ''}`
+                    : '이름을 입력해 주세요'}
                 </div>
                 <span className="dimensions">{activeItem?.width.toLocaleString()} × {activeItem?.height.toLocaleString()} px</span>
               </div>
