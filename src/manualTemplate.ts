@@ -128,6 +128,10 @@ function sampleEvenly<T>(items: T[], limit: number) {
   return Array.from({ length: limit }, (_, index) => items[Math.floor(index * stride)])
 }
 
+function energy(points: FeaturePoint[]) {
+  return points.reduce((sum, point) => sum + point.value * point.value, 0)
+}
+
 function makeTemplate(frame: GrayFrame, seedBox: BoundingBox) {
   const box = {
     x0: clamp(Math.floor(seedBox.x0 * frame.scale), 0, frame.width - 1),
@@ -162,14 +166,18 @@ function makeTemplate(frame: GrayFrame, seedBox: BoundingBox) {
     .sort((a, b) => b.value - a.value)
     .filter((point, index, all) => all.slice(0, index).every((other) => Math.hypot(point.u - other.u, point.v - other.v) > 0.12))
     .slice(0, 7)
+  const sampledInk = sampleEvenly(ink, 110)
+  const sampledAnchors = anchors.length >= 4 ? anchors : sampleEvenly(ink, 6)
 
   return {
     originalWidth: Math.max(1, seedBox.x1 - seedBox.x0),
     originalHeight: Math.max(1, seedBox.y1 - seedBox.y0),
     lightBackground,
-    ink: sampleEvenly(ink, 110),
+    ink: sampledInk,
+    inkEnergy: energy(sampledInk),
     quiet: sampleEvenly(quiet, 45),
-    anchors: anchors.length >= 4 ? anchors : sampleEvenly(ink, 6),
+    anchors: sampledAnchors,
+    anchorEnergy: energy(sampledAnchors),
   }
 }
 
@@ -228,24 +236,40 @@ export async function findManualTemplateMatches(
         if (lightBackground !== template.lightBackground) continue
 
         let anchorHits = 0
+        let anchorDot = 0
+        let anchorCandidateEnergy = 0
+        let anchorPeak = 0
         for (const anchor of template.anchors) {
           const xx = x + anchor.u * (width - 1)
           const yy = y + anchor.v * (height - 1)
           const gray = grayAt(targetFrame, xx, yy)
           const contrast = lightBackground ? background - gray : gray - background
           const value = Math.max(0, contrast / 255)
+          anchorDot += anchor.value * value
+          anchorCandidateEnergy += value * value
+          anchorPeak = Math.max(anchorPeak, value)
           if (value >= Math.max(0.055, anchor.value * 0.34)) anchorHits += 1
         }
-        if (anchorHits < Math.max(3, Math.ceil(template.anchors.length * 0.55))) continue
+        const requiredAnchorHits = Math.max(3, Math.ceil(template.anchors.length * 0.55))
+        const anchorCosine = anchorCandidateEnergy > 0 && template.anchorEnergy > 0
+          ? anchorDot / Math.sqrt(template.anchorEnergy * anchorCandidateEnergy)
+          : 0
+        // Keep the original anchor gate intact, but also allow a very similar low-contrast
+        // shape through. This recovers gray/faded text without changing existing matches.
+        if (anchorHits < requiredAnchorHits && (anchorPeak < 0.025 || anchorCosine < 0.9)) continue
 
         let inkDifference = 0
         let missingInk = 0
+        let inkDot = 0
+        let candidateInkEnergy = 0
         for (const point of template.ink) {
           const gray = grayAt(targetFrame, x + point.u * (width - 1), y + point.v * (height - 1))
           const contrast = lightBackground ? background - gray : gray - background
           const value = Math.max(0, contrast / 255)
           inkDifference += Math.abs(point.value - value)
           if (value < 0.045) missingInk += 1
+          inkDot += point.value * value
+          candidateInkEnergy += value * value
         }
         inkDifference /= template.ink.length
         missingInk /= template.ink.length
@@ -258,7 +282,15 @@ export async function findManualTemplateMatches(
         }
         if (template.quiet.length) backgroundInk /= template.quiet.length
 
-        const score = 1 - inkDifference * 1.08 - missingInk * 0.34 - backgroundInk * 0.48
+        // Base score is deliberately unchanged so the matcher keeps every detection it used
+        // to find. The alternate score compares the direction of the contrast vector instead
+        // of its magnitude, so the same glyph at lower opacity/contrast can still match.
+        const baseScore = 1 - inkDifference * 1.08 - missingInk * 0.34 - backgroundInk * 0.48
+        const cosine = candidateInkEnergy > 0 && template.inkEnergy > 0
+          ? inkDot / Math.sqrt(template.inkEnergy * candidateInkEnergy)
+          : 0
+        const contrastInvariantScore = clamp((cosine - 0.72) / 0.28, 0, 1) - backgroundInk * 0.22
+        const score = Math.max(baseScore, contrastInvariantScore)
         if (score < similarity) continue
         candidates.push({
           score,
