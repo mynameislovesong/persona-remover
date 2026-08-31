@@ -95,6 +95,10 @@ function median(values: number[]) {
   return sorted[Math.floor(sorted.length / 2)]
 }
 
+function luminance(pixel: readonly number[]) {
+  return pixel[0] * 0.299 + pixel[1] * 0.587 + pixel[2] * 0.114
+}
+
 function estimateBackground(
   data: Uint8ClampedArray,
   canvasWidth: number,
@@ -127,6 +131,50 @@ function estimateBackground(
     median(dominant.map((pixel) => pixel[1])),
     median(dominant.map((pixel) => pixel[2])),
     median(dominant.map((pixel) => pixel[3])),
+  ] as const
+}
+
+function estimateForeground(
+  data: Uint8ClampedArray,
+  canvasWidth: number,
+  canvasHeight: number,
+  box: BoundingBox,
+  background: readonly [number, number, number, number],
+) {
+  const inner = paddedBox(box, 0, canvasWidth, canvasHeight)
+  const backgroundLuminance = luminance(background)
+  const samples: [number, number, number, number][] = []
+
+  for (let y = inner.y0; y < inner.y1; y += 1) {
+    for (let x = inner.x0; x < inner.x1; x += 1) {
+      const index = (y * canvasWidth + x) * 4
+      const sample: [number, number, number, number] = [
+        data[index],
+        data[index + 1],
+        data[index + 2],
+        data[index + 3],
+      ]
+      const contrast = Math.abs(luminance(sample) - backgroundLuminance)
+      if (contrast >= 26) samples.push(sample)
+    }
+  }
+
+  if (!samples.length) {
+    return backgroundLuminance > 145
+      ? ([92, 96, 95, 255] as const)
+      : ([238, 240, 239, 255] as const)
+  }
+
+  const textSide = backgroundLuminance > 128
+    ? samples.filter((pixel) => luminance(pixel) < backgroundLuminance - 18)
+    : samples.filter((pixel) => luminance(pixel) > backgroundLuminance + 18)
+  const selected = textSide.length ? textSide : samples
+
+  return [
+    median(selected.map((pixel) => pixel[0])),
+    median(selected.map((pixel) => pixel[1])),
+    median(selected.map((pixel) => pixel[2])),
+    242,
   ] as const
 }
 
@@ -268,6 +316,48 @@ export async function findTemplateMatches(
   }))
 }
 
+function drawReplacement(
+  context: CanvasRenderingContext2D,
+  replacement: string,
+  box: BoundingBox,
+  foreground: readonly [number, number, number, number],
+) {
+  const targetWidth = Math.max(1, box.x1 - box.x0)
+  const height = Math.max(1, box.y1 - box.y0)
+  let fontSize = Math.max(8, Math.round(height * 0.9))
+  const fontFamily = `system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif`
+  context.font = `400 ${fontSize}px ${fontFamily}`
+
+  while (fontSize > 8 && context.measureText(replacement).width > targetWidth * 0.96) {
+    fontSize -= 1
+    context.font = `400 ${fontSize}px ${fontFamily}`
+  }
+
+  context.fillStyle = `rgba(${foreground[0]}, ${foreground[1]}, ${foreground[2]}, ${foreground[3] / 255})`
+  context.textBaseline = 'middle'
+
+  const graphemes = Array.from(replacement.normalize('NFC'))
+  const widths = graphemes.map((character) => context.measureText(character).width)
+  const naturalWidth = widths.reduce((sum, width) => sum + width, 0)
+  const desiredWidth = Math.min(targetWidth * 0.9, naturalWidth + fontSize * 1.15)
+
+  if (graphemes.length > 1 && naturalWidth < targetWidth * 0.78) {
+    const spacing = Math.max(0, (desiredWidth - naturalWidth) / (graphemes.length - 1))
+    const drawnWidth = naturalWidth + spacing * (graphemes.length - 1)
+    let x = (box.x0 + box.x1 - drawnWidth) / 2
+    const y = (box.y0 + box.y1) / 2
+    context.textAlign = 'left'
+    graphemes.forEach((character, index) => {
+      context.fillText(character, x, y)
+      x += widths[index] + spacing
+    })
+    return
+  }
+
+  context.textAlign = 'center'
+  context.fillText(replacement, (box.x0 + box.x1) / 2, (box.y0 + box.y1) / 2, targetWidth)
+}
+
 export async function eraseMatches(
   sourceUrl: string,
   matches: MatchBox[],
@@ -277,13 +367,18 @@ export async function eraseMatches(
   const canvas = document.createElement('canvas')
   const context = await drawImageToCanvas(sourceUrl, canvas)
   const frame = context.getImageData(0, 0, canvas.width, canvas.height)
-  const processed: { match: MatchBox; fill: readonly [number, number, number, number] }[] = []
+  const processed: {
+    match: MatchBox
+    fill: readonly [number, number, number, number]
+    foreground: readonly [number, number, number, number]
+  }[] = []
 
   for (const match of matches) {
     const box = paddedBox(match.bbox, padding, canvas.width, canvas.height)
     if (box.x1 <= box.x0 || box.y1 <= box.y0) continue
     const fill = estimateBackground(frame.data, canvas.width, canvas.height, box)
-    processed.push({ match, fill })
+    const foreground = estimateForeground(frame.data, canvas.width, canvas.height, match.bbox, fill)
+    processed.push({ match, fill, foreground })
     for (let y = box.y0; y < box.y1; y += 1) {
       for (let x = box.x0; x < box.x1; x += 1) {
         const index = (y * canvas.width + x) * 4
@@ -298,25 +393,8 @@ export async function eraseMatches(
 
   if (replacement) {
     context.save()
-    context.textAlign = 'center'
-    context.textBaseline = 'middle'
-    for (const { match, fill } of processed) {
-      const width = match.bbox.x1 - match.bbox.x0 + padding * 2
-      const height = match.bbox.y1 - match.bbox.y0
-      let fontSize = Math.max(8, Math.round(height * 0.88))
-      context.font = `600 ${fontSize}px system-ui, sans-serif`
-      while (fontSize > 8 && context.measureText(replacement).width > width) {
-        fontSize -= 1
-        context.font = `600 ${fontSize}px system-ui, sans-serif`
-      }
-      const luminance = fill[0] * 0.299 + fill[1] * 0.587 + fill[2] * 0.114
-      context.fillStyle = luminance > 145 ? 'rgba(35, 42, 40, 0.9)' : 'rgba(250, 252, 251, 0.92)'
-      context.fillText(
-        replacement,
-        (match.bbox.x0 + match.bbox.x1) / 2,
-        (match.bbox.y0 + match.bbox.y1) / 2,
-        Math.max(1, width),
-      )
+    for (const { match, foreground } of processed) {
+      drawReplacement(context, replacement, match.bbox, foreground)
     }
     context.restore()
   }
