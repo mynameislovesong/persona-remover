@@ -22,6 +22,7 @@ import {
   drawImageToCanvas,
   eraseMatches,
   normalizeImage,
+  prepareImageForOcr,
 } from './imageUtils'
 import { findMatches, type MatchMode } from './search'
 import type { BoundingBox, ImageItem, OcrWord } from './types'
@@ -36,10 +37,16 @@ const statusCopy = {
   error: '오류',
 } as const
 
+type TesseractSymbolLike = {
+  text?: string
+  bbox?: BoundingBox
+}
+
 type TesseractWordLike = {
   text?: string
   confidence?: number
   bbox?: BoundingBox
+  symbols?: TesseractSymbolLike[]
 }
 
 type TesseractLineLike = {
@@ -54,9 +61,27 @@ type TesseractBlockLike = {
   paragraphs?: TesseractParagraphLike[]
 }
 
-function extractWords(data: unknown): OcrWord[] {
+function scaleBoundingBox(box: BoundingBox, scale: number): BoundingBox {
+  const safeScale = scale > 0 ? scale : 1
+  return {
+    x0: box.x0 / safeScale,
+    y0: box.y0 / safeScale,
+    x1: box.x1 / safeScale,
+    y1: box.y1 / safeScale,
+  }
+}
+
+function extractWords(data: unknown, coordinateScale = 1): OcrWord[] {
   const shaped = data as { blocks?: TesseractBlockLike[]; words?: TesseractWordLike[] }
   const words: OcrWord[] = []
+
+  const sanitizeSymbols = (symbols?: TesseractSymbolLike[]) =>
+    (symbols ?? [])
+      .filter((symbol) => symbol.text?.trim() && symbol.bbox)
+      .map((symbol) => ({
+        text: symbol.text!.trim(),
+        bbox: scaleBoundingBox(symbol.bbox!, coordinateScale),
+      }))
 
   if (shaped.blocks) {
     shaped.blocks.forEach((block, blockIndex) => {
@@ -69,7 +94,8 @@ function extractWords(data: unknown): OcrWord[] {
               lineId: `${blockIndex}-${paragraphIndex}-${lineIndex}`,
               text: word.text.trim(),
               confidence: word.confidence ?? 0,
-              bbox: word.bbox,
+              bbox: scaleBoundingBox(word.bbox, coordinateScale),
+              symbols: sanitizeSymbols(word.symbols),
             })
           })
         })
@@ -80,10 +106,11 @@ function extractWords(data: unknown): OcrWord[] {
       if (!word.text?.trim() || !word.bbox) return
       words.push({
         id: `word-${index}`,
-        lineId: `fallback-${Math.round(word.bbox.y0 / 16)}`,
+        lineId: `fallback-${Math.round(word.bbox.y0 / (16 * Math.max(1, coordinateScale)))}`,
         text: word.text.trim(),
         confidence: word.confidence ?? 0,
-        bbox: word.bbox,
+        bbox: scaleBoundingBox(word.bbox, coordinateScale),
+        symbols: sanitizeSymbols(word.symbols),
       })
     })
   }
@@ -151,8 +178,9 @@ function App() {
     void (async () => {
       try {
         const worker = await getWorker()
-        const result = await worker.recognize(queued.sourceBlob, {}, { blocks: true })
-        const words = extractWords(result.data)
+        const prepared = await prepareImageForOcr(queued.sourceUrl)
+        const result = await worker.recognize(prepared.blob, {}, { blocks: true })
+        const words = extractWords(result.data, prepared.scale)
         updateItem(queued.id, { status: 'detected', progress: 100, words })
       } catch (error) {
         const message = error instanceof Error ? error.message : '알 수 없는 OCR 오류'
