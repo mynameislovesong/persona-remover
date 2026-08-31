@@ -1,0 +1,25 @@
+.empty-copy .section-kicker {
+  display: none;
+}
+
+.empty-copy h1#empty-title {
+  margin-top: 0;
+  font-size: 0;
+  line-height: 1;
+}
+
+.empty-copy h1#empty-title::after {
+  content: 'Persona Remover';
+  display: block;
+  font-size: clamp(44px, 7vw, 88px);
+  line-height: 1;
+  letter-spacing: -0.035em;
+  white-space: nowrap;
+}
+
+@media (max-width: 700px) {
+  .empty-copy h1#empty-title::after {
+    font-size: clamp(42px, 13vw, 68px);
+    white-space: normal;
+  }
+}
