@@ -2,12 +2,18 @@ export type ImageStatus = 'queued' | 'ocr' | 'detected' | 'edited' | 'error'
 
 export type BoundingBox = { x0: number; y0: number; x1: number; y1: number }
 
+export type OcrSymbol = {
+  text: string
+  bbox: BoundingBox
+}
+
 export type OcrWord = {
   id: string
   lineId: string
   text: string
   confidence: number
   bbox: BoundingBox
+  symbols?: OcrSymbol[]
 }
 
 export type MatchBox = {
