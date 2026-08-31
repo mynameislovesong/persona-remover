@@ -88,4 +88,3 @@ vite.config.ts
 ## 브라우저 참고
 
 최신 Chrome, Edge, Firefox, Safari를 권장합니다. 고해상도 이미지는 원본 크기로 유지되므로 여러 장을 처리할 때 기기 메모리에 따라 시간이 걸릴 수 있습니다. iPhone Safari에서도 순차 OCR로 동시에 큰 캔버스를 여러 개 만들지 않도록 구성되어 있습니다.
-
