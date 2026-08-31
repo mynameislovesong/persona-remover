@@ -98,7 +98,7 @@ button:focus-visible, input:focus-visible { outline: 3px solid rgba(8, 127, 113,
 .preview-area { min-width: 0; min-height: 0; padding: 22px; display: flex; align-items: center; justify-content: center; overflow: auto; background-color: #e8eceb; background-image: linear-gradient(45deg, #dde2e0 25%, transparent 25%), linear-gradient(-45deg, #dde2e0 25%, transparent 25%), linear-gradient(45deg, transparent 75%, #dde2e0 75%), linear-gradient(-45deg, transparent 75%, #dde2e0 75%); background-size: 16px 16px; background-position: 0 0, 0 8px, 8px -8px, -8px 0px; }
 .preview-area canvas { display: block; max-width: 100%; max-height: calc(100dvh - 320px); width: auto; height: auto; background: white; box-shadow: 0 12px 35px rgba(23, 32, 30, .16); }
 .preview-area canvas.interactive { cursor: pointer; }
-.preview-area canvas.selecting { cursor: crosshair; touch-action: none; user-select: none; -webkit-user-select: none; }
+.preview-area canvas.selecting { cursor: crosshair; touch-action: pinch-zoom; user-select: none; -webkit-user-select: none; }
 .error-state { max-width: 480px; padding: 30px; text-align: center; background: white; border: 1px solid #edcdc9; }
 .error-state strong { color: #a43c32; }.error-state p { color: var(--muted); font-size: 12px; line-height: 1.6; }
 .action-bar { min-height: 65px; padding: 10px 16px; display: flex; align-items: center; justify-content: space-between; gap: 12px; border-top: 1px solid var(--line); }
