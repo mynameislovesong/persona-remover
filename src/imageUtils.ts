@@ -30,6 +30,43 @@ export async function normalizeImage(file: File) {
   }
 }
 
+export async function prepareImageForOcr(sourceUrl: string) {
+  const image = await loadImage(sourceUrl)
+  const longest = Math.max(image.naturalWidth, image.naturalHeight)
+  const scale = longest <= 1400 ? 2 : longest <= 2200 ? 1.5 : 1
+  const width = Math.max(1, Math.round(image.naturalWidth * scale))
+  const height = Math.max(1, Math.round(image.naturalHeight * scale))
+
+  const canvas = document.createElement('canvas')
+  canvas.width = width
+  canvas.height = height
+  const context = canvas.getContext('2d', { alpha: false, willReadFrequently: true })
+  if (!context) throw new Error('OCR용 Canvas를 사용할 수 없습니다.')
+
+  context.fillStyle = '#ffffff'
+  context.fillRect(0, 0, width, height)
+  context.imageSmoothingEnabled = true
+  context.imageSmoothingQuality = 'high'
+  context.drawImage(image, 0, 0, width, height)
+
+  const frame = context.getImageData(0, 0, width, height)
+  const data = frame.data
+  const contrast = 42
+  const factor = (259 * (contrast + 255)) / (255 * (259 - contrast))
+
+  for (let index = 0; index < data.length; index += 4) {
+    const gray = data[index] * 0.299 + data[index + 1] * 0.587 + data[index + 2] * 0.114
+    const adjusted = Math.max(0, Math.min(255, factor * (gray - 128) + 128))
+    data[index] = adjusted
+    data[index + 1] = adjusted
+    data[index + 2] = adjusted
+    data[index + 3] = 255
+  }
+
+  context.putImageData(frame, 0, 0)
+  return { blob: await canvasToBlob(canvas), scale }
+}
+
 export async function drawImageToCanvas(url: string, canvas: HTMLCanvasElement) {
   const image = await loadImage(url)
   canvas.width = image.naturalWidth
