@@ -4,6 +4,7 @@ export type MatchMode = 'exact' | 'contains'
 
 const compact = (value: string) => value.replace(/\s+/g, '').normalize('NFC')
 const toChars = (value: string) => Array.from(compact(value).toLocaleLowerCase())
+
 const PARTICLES = [
   '한테서', '에게서', '이라도', '이라고', '이라면', '으로서', '으로써',
   '에게', '한테', '께서', '에서', '부터', '까지', '처럼', '보다', '이라', '라고',
@@ -76,35 +77,6 @@ function partialBoundingBox(
   return fallbackPartialBoundingBox(words, owners[startIndex], owners[endIndex])
 }
 
-function levenshtein(a: string, b: string) {
-  const aa = Array.from(a)
-  const bb = Array.from(b)
-  const previous = Array.from({ length: bb.length + 1 }, (_, index) => index)
-  const current = new Array<number>(bb.length + 1)
-
-  for (let i = 1; i <= aa.length; i += 1) {
-    current[0] = i
-    for (let j = 1; j <= bb.length; j += 1) {
-      current[j] = Math.min(
-        current[j - 1] + 1,
-        previous[j] + 1,
-        previous[j - 1] + (aa[i - 1] === bb[j - 1] ? 0 : 1),
-      )
-    }
-    for (let j = 0; j <= bb.length; j += 1) previous[j] = current[j]
-  }
-  return previous[bb.length]
-}
-
-function stripParticle(value: string) {
-  for (const particle of PARTICLES) {
-    if (value.length > particle.length && value.endsWith(particle)) {
-      return { stem: value.slice(0, -particle.length), particle }
-    }
-  }
-  return { stem: value, particle: '' }
-}
-
 function boxOverlap(a: BoundingBox, b: BoundingBox) {
   const x0 = Math.max(a.x0, b.x0)
   const y0 = Math.max(a.y0, b.y0)
@@ -122,9 +94,12 @@ function addResult(results: MatchBox[], result: MatchBox) {
   if (!duplicate) results.push(result)
 }
 
+// Visual-template candidates turned out to be too aggressive for real logs.
+// Keep this helper for compatibility with App.tsx, but only trust the OCR-backed group.
 export function mergeMatchBoxes(...groups: MatchBox[][]) {
   const merged: MatchBox[] = []
-  for (const match of groups.flat()) addResult(merged, match)
+  const trusted = groups[0] ?? []
+  for (const match of trusted) addResult(merged, match)
   return merged
 }
 
@@ -132,102 +107,53 @@ export function findMatches(words: OcrWord[], query: string, mode: MatchMode): M
   const normalizedQuery = compact(query).toLocaleLowerCase()
   if (!normalizedQuery) return []
 
-  const paragraphs = new Map<string, OcrWord[]>()
+  const lines = new Map<string, OcrWord[]>()
   for (const word of words) {
-    const parts = word.lineId.split('-')
-    const paragraphId = parts[0] === 'fallback' ? 'fallback' : parts.slice(0, -1).join('-')
-    const paragraph = paragraphs.get(paragraphId)
-    if (paragraph) paragraph.push(word)
-    else paragraphs.set(paragraphId, [word])
+    const line = lines.get(word.lineId)
+    if (line) line.push(word)
+    else lines.set(word.lineId, [word])
   }
 
   const results: MatchBox[] = []
 
-  for (const paragraphWords of paragraphs.values()) {
-    const ordered = [...paragraphWords].sort((a, b) => a.bbox.x0 - b.bbox.x0)
+  for (const lineWords of lines.values()) {
+    const ordered = [...lineWords].sort((a, b) => a.bbox.x0 - b.bbox.x0)
     const pieces = ordered.map((word) => toChars(word.text).join(''))
     const text = pieces.join('')
     const owners: CharacterOwner[] = []
-    const wordStarts: number[] = []
-    let characterCursor = 0
 
     ordered.forEach((word, wordIndex) => {
-      wordStarts[wordIndex] = characterCursor
       const chars = toChars(word.text)
       const symbolBoxes = getSymbolCharBoxes(word)
       chars.forEach((_, offset) => {
         owners.push({ wordIndex, offset, length: chars.length, bbox: symbolBoxes[offset] })
-        characterCursor += 1
       })
     })
 
-    if (mode === 'contains') {
-      let cursor = text.indexOf(normalizedQuery)
-      while (cursor !== -1) {
-        const startOwner = owners[cursor]
-        const endOwner = owners[cursor + normalizedQuery.length - 1]
-        if (startOwner && endOwner) {
+    let cursor = text.indexOf(normalizedQuery)
+    while (cursor !== -1) {
+      const startOwner = owners[cursor]
+      const endOwner = owners[cursor + normalizedQuery.length - 1]
+
+      if (startOwner && endOwner) {
+        const endWordText = pieces[endOwner.wordIndex]
+        const suffix = endWordText.slice(endOwner.offset + 1)
+        const startsAtTokenBoundary = startOwner.offset === 0
+        const acceptableSuffix = !suffix || PARTICLES.includes(suffix)
+        const acceptable = mode === 'contains' || (startsAtTokenBoundary && acceptableSuffix)
+
+        if (acceptable) {
           const matched = ordered.slice(startOwner.wordIndex, endOwner.wordIndex + 1)
           addResult(results, {
-            id: `contains:${matched.map((word) => word.id).join('+')}:${cursor}`,
+            id: `${mode}:${matched.map((word) => word.id).join('+')}:${cursor}`,
             text: matched.map((word) => word.text).join(' '),
             wordIds: matched.map((word) => word.id),
             bbox: partialBoundingBox(ordered, owners, cursor, cursor + normalizedQuery.length - 1),
           })
         }
-        cursor = text.indexOf(normalizedQuery, cursor + Math.max(1, normalizedQuery.length))
       }
-    } else {
-      // Exact name matching still accepts normal Korean particles attached to the name.
-      let cursor = text.indexOf(normalizedQuery)
-      while (cursor !== -1) {
-        const startOwner = owners[cursor]
-        const endOwner = owners[cursor + normalizedQuery.length - 1]
-        if (startOwner && endOwner && startOwner.offset === 0) {
-          const endWordText = pieces[endOwner.wordIndex]
-          const suffix = endWordText.slice(endOwner.offset + 1)
-          if (!suffix || PARTICLES.includes(suffix)) {
-            const matched = ordered.slice(startOwner.wordIndex, endOwner.wordIndex + 1)
-            addResult(results, {
-              id: `exact:${matched.map((word) => word.id).join('+')}:${cursor}`,
-              text: matched.map((word) => word.text).join(' '),
-              wordIds: matched.map((word) => word.id),
-              bbox: partialBoundingBox(ordered, owners, cursor, cursor + normalizedQuery.length - 1),
-            })
-          }
-        }
-        cursor = text.indexOf(normalizedQuery, cursor + Math.max(1, normalizedQuery.length))
-      }
-    }
 
-    // OCR recovery: compare one-to-three neighboring OCR tokens with the requested name.
-    // One wrong/missing glyph is accepted for names of 3+ characters, while a recognized
-    // Korean particle is stripped before comparison so "히사키의" can still suggest 히사카.
-    if (normalizedQuery.length >= 3) {
-      for (let startWord = 0; startWord < ordered.length; startWord += 1) {
-        let candidate = ''
-        for (let endWord = startWord; endWord < Math.min(ordered.length, startWord + 3); endWord += 1) {
-          candidate += pieces[endWord]
-          const { stem } = stripParticle(candidate)
-          if (stem.length >= normalizedQuery.length - 1 && stem.length <= normalizedQuery.length + 1) {
-            const distance = levenshtein(stem, normalizedQuery)
-            if (distance === 1) {
-              const startIndex = wordStarts[startWord]
-              const endIndex = startIndex + Math.min(stem.length, owners.length - startIndex) - 1
-              const matched = ordered.slice(startWord, endWord + 1)
-              if (endIndex >= startIndex && owners[startIndex] && owners[endIndex]) {
-                addResult(results, {
-                  id: `fuzzy:${matched.map((word) => word.id).join('+')}:${startIndex}`,
-                  text: matched.map((word) => word.text).join(' '),
-                  wordIds: matched.map((word) => word.id),
-                  bbox: partialBoundingBox(ordered, owners, startIndex, endIndex),
-                })
-              }
-            }
-          }
-          if (candidate.length > normalizedQuery.length + 5) break
-        }
-      }
+      cursor = text.indexOf(normalizedQuery, cursor + Math.max(1, normalizedQuery.length))
     }
   }
 
