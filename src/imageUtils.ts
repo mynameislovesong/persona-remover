@@ -205,10 +205,6 @@ function samplePoints(points: TemplatePoint[], limit: number) {
   return Array.from({ length: limit }, (_, index) => points[Math.floor(index * stride)])
 }
 
-// Uses one or more OCR-confirmed name boxes as a visual template and searches the same
-// screenshot for repeated glyph shapes. This is intentionally lightweight and local: the
-// image never leaves the browser, and it mainly helps chat logs where the same font/scale
-// repeats many times but OCR misses a few occurrences.
 export async function findTemplateMatches(
   sourceUrl: string,
   seedMatches: MatchBox[],
@@ -324,7 +320,7 @@ function drawReplacement(
 ) {
   const targetWidth = Math.max(1, box.x1 - box.x0)
   const height = Math.max(1, box.y1 - box.y0)
-  let fontSize = Math.max(8, Math.round(height * 0.9))
+  let fontSize = Math.max(8, Math.round(height * 0.88))
   const fontFamily = `system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif`
   context.font = `400 ${fontSize}px ${fontFamily}`
 
@@ -335,27 +331,18 @@ function drawReplacement(
 
   context.fillStyle = `rgba(${foreground[0]}, ${foreground[1]}, ${foreground[2]}, ${foreground[3] / 255})`
   context.textBaseline = 'middle'
-
-  const graphemes = Array.from(replacement.normalize('NFC'))
-  const widths = graphemes.map((character) => context.measureText(character).width)
-  const naturalWidth = widths.reduce((sum, width) => sum + width, 0)
-  const desiredWidth = Math.min(targetWidth * 0.9, naturalWidth + fontSize * 1.15)
-
-  if (graphemes.length > 1 && naturalWidth < targetWidth * 0.78) {
-    const spacing = Math.max(0, (desiredWidth - naturalWidth) / (graphemes.length - 1))
-    const drawnWidth = naturalWidth + spacing * (graphemes.length - 1)
-    let x = (box.x0 + box.x1 - drawnWidth) / 2
-    const y = (box.y0 + box.y1) / 2
-    context.textAlign = 'left'
-    graphemes.forEach((character, index) => {
-      context.fillText(character, x, y)
-      x += widths[index] + spacing
-    })
-    return
-  }
-
   context.textAlign = 'center'
-  context.fillText(replacement, (box.x0 + box.x1) / 2, (box.y0 + box.y1) / 2, targetWidth)
+
+  const naturalWidth = context.measureText(replacement).width
+  const spareWidth = Math.max(0, targetWidth - naturalWidth)
+  const rightBias = Math.min(spareWidth * 0.22, fontSize * 0.18)
+  const x = (box.x0 + box.x1) / 2 + rightBias
+  const y = (box.y0 + box.y1) / 2
+
+  // Keep short masks such as "□□" visually together. Expanding letter spacing to fill
+  // a three-character OCR box made the two mask glyphs look like unrelated symbols.
+  // We only shrink when needed; narrow replacements are never stretched apart.
+  context.fillText(replacement, x, y, targetWidth * 0.96)
 }
 
 export async function eraseMatches(
