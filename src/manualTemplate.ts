@@ -34,10 +34,6 @@ function median(values: number[]) {
   return sorted[Math.floor(sorted.length / 2)]
 }
 
-function yieldToBrowser() {
-  return new Promise<void>((resolve) => window.setTimeout(resolve, 0))
-}
-
 async function makeGrayFrame(url: string, maxLongest = 900): Promise<GrayFrame> {
   const image = await loadImage(url)
   const longest = Math.max(image.naturalWidth, image.naturalHeight)
@@ -220,19 +216,12 @@ export async function findManualTemplateMatches(
   const candidates: Candidate[] = []
   const sizeVariants = [0.92, 0.96, 1, 1.04, 1.08]
 
-  // Let React paint the "finding candidates" state before the expensive scan begins.
-  await yieldToBrowser()
-
   for (const variant of sizeVariants) {
     const width = Math.max(4, Math.round(template.originalWidth * targetFrame.scale * variant))
     const height = Math.max(3, Math.round(template.originalHeight * targetFrame.scale * variant))
     if (width >= targetFrame.width || height >= targetFrame.height) continue
 
     for (let y = 0; y <= targetFrame.height - height; y += 1) {
-      // Long screenshots can take a while on iPhone. Yield every few rows so the spinner,
-      // progress banner and touch UI stay visibly alive while the local scan is running.
-      if (y > 0 && y % 36 === 0) await yieldToBrowser()
-
       for (let x = 0; x <= targetFrame.width - width; x += 1) {
         const background = candidateBackground(targetFrame, x, y, width, height)
         const lightBackground = background >= 128
