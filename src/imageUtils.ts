@@ -130,6 +130,144 @@ function estimateBackground(
   ] as const
 }
 
+function overlapRatio(a: BoundingBox, b: BoundingBox) {
+  const x0 = Math.max(a.x0, b.x0)
+  const y0 = Math.max(a.y0, b.y0)
+  const x1 = Math.min(a.x1, b.x1)
+  const y1 = Math.min(a.y1, b.y1)
+  if (x1 <= x0 || y1 <= y0) return 0
+  const intersection = (x1 - x0) * (y1 - y0)
+  const areaA = Math.max(1, (a.x1 - a.x0) * (a.y1 - a.y0))
+  const areaB = Math.max(1, (b.x1 - b.x0) * (b.y1 - b.y0))
+  return intersection / Math.min(areaA, areaB)
+}
+
+function darkness(data: Uint8ClampedArray, width: number, x: number, y: number) {
+  const index = (y * width + x) * 4
+  const gray = data[index] * 0.299 + data[index + 1] * 0.587 + data[index + 2] * 0.114
+  return Math.max(0, Math.min(1, (248 - gray) / 248))
+}
+
+type TemplatePoint = { x: number; y: number; value: number }
+type TemplateCandidate = { bbox: BoundingBox; score: number }
+
+function samplePoints(points: TemplatePoint[], limit: number) {
+  if (points.length <= limit) return points
+  const stride = points.length / limit
+  return Array.from({ length: limit }, (_, index) => points[Math.floor(index * stride)])
+}
+
+// Uses one or more OCR-confirmed name boxes as a visual template and searches the same
+// screenshot for repeated glyph shapes. This is intentionally lightweight and local: the
+// image never leaves the browser, and it mainly helps chat logs where the same font/scale
+// repeats many times but OCR misses a few occurrences.
+export async function findTemplateMatches(
+  sourceUrl: string,
+  seedMatches: MatchBox[],
+  existingMatches: MatchBox[],
+) {
+  const validSeeds = seedMatches.filter((match) => {
+    const width = match.bbox.x1 - match.bbox.x0
+    const height = match.bbox.y1 - match.bbox.y0
+    return width >= 12 && height >= 8
+  })
+  if (!validSeeds.length) return [] as MatchBox[]
+
+  const image = await loadImage(sourceUrl)
+  const longest = Math.max(image.naturalWidth, image.naturalHeight)
+  const scale = Math.min(0.45, 900 / Math.max(1, longest))
+  const workWidth = Math.max(1, Math.round(image.naturalWidth * scale))
+  const workHeight = Math.max(1, Math.round(image.naturalHeight * scale))
+
+  const canvas = document.createElement('canvas')
+  canvas.width = workWidth
+  canvas.height = workHeight
+  const context = canvas.getContext('2d', { alpha: false, willReadFrequently: true })
+  if (!context) return [] as MatchBox[]
+  context.fillStyle = '#ffffff'
+  context.fillRect(0, 0, workWidth, workHeight)
+  context.drawImage(image, 0, 0, workWidth, workHeight)
+  const frame = context.getImageData(0, 0, workWidth, workHeight)
+
+  const widths = validSeeds.map((match) => match.bbox.x1 - match.bbox.x0).sort((a, b) => a - b)
+  const medianWidth = widths[Math.floor(widths.length / 2)]
+  const seeds = [...validSeeds]
+    .sort((a, b) => Math.abs((a.bbox.x1 - a.bbox.x0) - medianWidth) - Math.abs((b.bbox.x1 - b.bbox.x0) - medianWidth))
+    .slice(0, 3)
+
+  const candidates: TemplateCandidate[] = []
+
+  for (const seed of seeds) {
+    const x0 = clamp(Math.round(seed.bbox.x0 * scale), 0, workWidth - 1)
+    const y0 = clamp(Math.round(seed.bbox.y0 * scale), 0, workHeight - 1)
+    const x1 = clamp(Math.round(seed.bbox.x1 * scale), x0 + 1, workWidth)
+    const y1 = clamp(Math.round(seed.bbox.y1 * scale), y0 + 1, workHeight)
+    const templateWidth = x1 - x0
+    const templateHeight = y1 - y0
+    if (templateWidth < 4 || templateHeight < 3) continue
+
+    const ink: TemplatePoint[] = []
+    const background: TemplatePoint[] = []
+    for (let y = 0; y < templateHeight; y += 1) {
+      for (let x = 0; x < templateWidth; x += 1) {
+        const value = darkness(frame.data, workWidth, x0 + x, y0 + y)
+        if (value > 0.1) ink.push({ x, y, value })
+        else if ((x + y) % 3 === 0) background.push({ x, y, value })
+      }
+    }
+    const inkPoints = samplePoints(ink, 150)
+    const backgroundPoints = samplePoints(background, 80)
+    if (inkPoints.length < 8) continue
+
+    const probe = inkPoints[Math.floor(inkPoints.length / 2)]
+    for (let y = 0; y <= workHeight - templateHeight; y += 1) {
+      for (let x = 0; x <= workWidth - templateWidth; x += 1) {
+        if (darkness(frame.data, workWidth, x + probe.x, y + probe.y) < 0.04) continue
+
+        let inkDifference = 0
+        for (const point of inkPoints) {
+          inkDifference += Math.abs(point.value - darkness(frame.data, workWidth, x + point.x, y + point.y))
+        }
+        inkDifference /= inkPoints.length
+
+        let backgroundDifference = 0
+        for (const point of backgroundPoints) {
+          backgroundDifference += Math.abs(point.value - darkness(frame.data, workWidth, x + point.x, y + point.y))
+        }
+        if (backgroundPoints.length) backgroundDifference /= backgroundPoints.length
+
+        const score = 1 - inkDifference * 0.78 - backgroundDifference * 0.22
+        if (score < 0.87) continue
+
+        candidates.push({
+          score,
+          bbox: {
+            x0: x / scale,
+            y0: y / scale,
+            x1: (x + templateWidth) / scale,
+            y1: (y + templateHeight) / scale,
+          },
+        })
+      }
+    }
+  }
+
+  const accepted: TemplateCandidate[] = []
+  for (const candidate of candidates.sort((a, b) => b.score - a.score)) {
+    if (existingMatches.some((match) => overlapRatio(match.bbox, candidate.bbox) > 0.55)) continue
+    if (accepted.some((item) => overlapRatio(item.bbox, candidate.bbox) > 0.45)) continue
+    accepted.push(candidate)
+    if (accepted.length >= 30) break
+  }
+
+  return accepted.map((candidate, index) => ({
+    id: `template:${index}:${Math.round(candidate.bbox.x0)}:${Math.round(candidate.bbox.y0)}`,
+    text: '이미지 유사도 후보',
+    wordIds: [],
+    bbox: candidate.bbox,
+  }))
+}
+
 export async function eraseMatches(
   sourceUrl: string,
   matches: MatchBox[],
