@@ -1,0 +1,4 @@
+.edit-mode,
+.replacement-field {
+  display: none !important;
+}
