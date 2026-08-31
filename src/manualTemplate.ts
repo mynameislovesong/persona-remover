@@ -34,12 +34,6 @@ function median(values: number[]) {
   return sorted[Math.floor(sorted.length / 2)]
 }
 
-function quantile(values: number[], ratio: number) {
-  if (!values.length) return 255
-  const sorted = [...values].sort((a, b) => a - b)
-  return sorted[Math.min(sorted.length - 1, Math.max(0, Math.round((sorted.length - 1) * ratio)))]
-}
-
 async function makeGrayFrame(url: string, maxLongest = 900): Promise<GrayFrame> {
   const image = await loadImage(url)
   const longest = Math.max(image.naturalWidth, image.naturalHeight)
@@ -86,38 +80,6 @@ function borderSamples(frame: GrayFrame, box: BoundingBox) {
     values.push(grayAt(frame, x0, y), grayAt(frame, x1 - 1, y))
   }
   return values
-}
-
-function gridSamples(frame: GrayFrame, x: number, y: number, width: number, height: number) {
-  const values: number[] = []
-  const columns = 7
-  const rows = 5
-  for (let row = 0; row < rows; row += 1) {
-    for (let column = 0; column < columns; column += 1) {
-      const xx = x + ((column + 0.5) / columns) * Math.max(1, width - 1)
-      const yy = y + ((row + 0.5) / rows) * Math.max(1, height - 1)
-      values.push(grayAt(frame, xx, yy))
-    }
-  }
-  return values
-}
-
-function estimateBackgroundFromGrid(
-  frame: GrayFrame,
-  x: number,
-  y: number,
-  width: number,
-  height: number,
-  lightBackground?: boolean,
-) {
-  const samples = gridSamples(frame, x, y, width, height)
-  const light = lightBackground ?? median(samples) >= 128
-  // Text crops are intentionally tight, so the perimeter often contains glyph pixels.
-  // Use the bright/dark side of a small interior grid instead of a few edge pixels.
-  return {
-    value: quantile(samples, light ? 0.82 : 0.18),
-    light,
-  }
 }
 
 function tightenSeed(frame: GrayFrame, originalBox: BoundingBox) {
@@ -175,9 +137,8 @@ function makeTemplate(frame: GrayFrame, seedBox: BoundingBox) {
   }
   const width = Math.max(1, box.x1 - box.x0)
   const height = Math.max(1, box.y1 - box.y0)
-  const estimated = estimateBackgroundFromGrid(frame, box.x0, box.y0, width, height)
-  const background = estimated.value
-  const lightBackground = estimated.light
+  const background = median(borderSamples(frame, box))
+  const lightBackground = background >= 128
   const ink: FeaturePoint[] = []
   const quiet: FeaturePoint[] = []
 
@@ -212,15 +173,15 @@ function makeTemplate(frame: GrayFrame, seedBox: BoundingBox) {
   }
 }
 
-function candidateBackground(
-  frame: GrayFrame,
-  x: number,
-  y: number,
-  width: number,
-  height: number,
-  lightBackground: boolean,
-) {
-  return estimateBackgroundFromGrid(frame, x, y, width, height, lightBackground).value
+function candidateBackground(frame: GrayFrame, x: number, y: number, width: number, height: number) {
+  const x1 = x + width - 1
+  const y1 = y + height - 1
+  const mx = x + width / 2
+  const my = y + height / 2
+  return median([
+    grayAt(frame, x, y), grayAt(frame, x1, y), grayAt(frame, x, y1), grayAt(frame, x1, y1),
+    grayAt(frame, mx, y), grayAt(frame, mx, y1), grayAt(frame, x, my), grayAt(frame, x1, my),
+  ])
 }
 
 function overlapRatio(a: BoundingBox, b: BoundingBox) {
@@ -246,22 +207,10 @@ export async function findManualTemplateMatches(
   targetSourceUrl: string,
   similarity = 0.82,
 ): Promise<ManualTemplateSearchResult> {
-  let seedFrame: GrayFrame
-  let targetFrame: GrayFrame
-
-  if (seedSourceUrl === targetSourceUrl) {
-    // Using two differently downscaled copies of the same screenshot changes antialiasing
-    // enough for identical glyphs to get different scores. Reuse one frame instead.
-    const sharedFrame = await makeGrayFrame(seedSourceUrl, 900)
-    seedFrame = sharedFrame
-    targetFrame = sharedFrame
-  } else {
-    ;[seedFrame, targetFrame] = await Promise.all([
-      makeGrayFrame(seedSourceUrl, 900),
-      makeGrayFrame(targetSourceUrl, 900),
-    ])
-  }
-
+  const [seedFrame, targetFrame] = await Promise.all([
+    makeGrayFrame(seedSourceUrl, 1100),
+    makeGrayFrame(targetSourceUrl, 900),
+  ])
   const seedBox = tightenSeed(seedFrame, rawSeedBox)
   const template = makeTemplate(seedFrame, seedBox)
   const candidates: Candidate[] = []
@@ -274,8 +223,9 @@ export async function findManualTemplateMatches(
 
     for (let y = 0; y <= targetFrame.height - height; y += 1) {
       for (let x = 0; x <= targetFrame.width - width; x += 1) {
-        const lightBackground = template.lightBackground
-        const background = candidateBackground(targetFrame, x, y, width, height, lightBackground)
+        const background = candidateBackground(targetFrame, x, y, width, height)
+        const lightBackground = background >= 128
+        if (lightBackground !== template.lightBackground) continue
 
         let anchorHits = 0
         for (const anchor of template.anchors) {
