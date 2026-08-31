@@ -13,6 +13,40 @@ function unionBoxes(words: OcrWord[]): BoundingBox {
 
 const compact = (value: string) => value.replace(/\s+/g, '').normalize('NFC')
 
+type CharacterOwner = {
+  wordIndex: number
+  offset: number
+  length: number
+}
+
+function partialBoundingBox(
+  words: OcrWord[],
+  startOwner: CharacterOwner,
+  endOwner: CharacterOwner,
+): BoundingBox {
+  const matched = words.slice(startOwner.wordIndex, endOwner.wordIndex + 1)
+  const box = unionBoxes(matched)
+  const startWord = words[startOwner.wordIndex]
+  const endWord = words[endOwner.wordIndex]
+
+  // Tesseract often returns Korean particles attached to the name as one word
+  // (for example "뤼붕이를"). When the search only matches part of that word,
+  // estimate the matched character range inside the word box instead of
+  // erasing the whole OCR token. Hangul glyphs are close to fixed-width, so
+  // this is substantially more accurate for chat-log screenshots.
+  const startWidth = startWord.bbox.x1 - startWord.bbox.x0
+  const endWidth = endWord.bbox.x1 - endWord.bbox.x0
+
+  box.x0 =
+    startWord.bbox.x0 +
+    startWidth * (startOwner.offset / Math.max(1, startOwner.length))
+  box.x1 =
+    endWord.bbox.x0 +
+    endWidth * ((endOwner.offset + 1) / Math.max(1, endOwner.length))
+
+  return box
+}
+
 export function findMatches(
   words: OcrWord[],
   query: string,
@@ -35,17 +69,21 @@ export function findMatches(
 
   for (const paragraphWords of paragraphs.values()) {
     const ordered = [...paragraphWords]
-    const text = ordered.map((word) => compact(word.text)).join('').toLocaleLowerCase()
-    const owners: number[] = []
-    ordered.forEach((word, index) => {
-      for (let i = 0; i < compact(word.text).length; i += 1) owners.push(index)
+    const pieces = ordered.map((word) => compact(word.text).toLocaleLowerCase())
+    const text = pieces.join('')
+    const owners: CharacterOwner[] = []
+
+    pieces.forEach((piece, wordIndex) => {
+      for (let offset = 0; offset < piece.length; offset += 1) {
+        owners.push({ wordIndex, offset, length: piece.length })
+      }
     })
 
     if (mode === 'exact') {
       for (let start = 0; start < ordered.length; start += 1) {
         let candidate = ''
         for (let end = start; end < ordered.length; end += 1) {
-          candidate += compact(ordered[end].text).toLocaleLowerCase()
+          candidate += pieces[end]
           if (candidate === normalizedQuery) {
             const matched = ordered.slice(start, end + 1)
             const id = matched.map((word) => word.id).join('+')
@@ -70,7 +108,7 @@ export function findMatches(
       const startOwner = owners[cursor]
       const endOwner = owners[cursor + normalizedQuery.length - 1]
       if (startOwner !== undefined && endOwner !== undefined) {
-        const matched = ordered.slice(startOwner, endOwner + 1)
+        const matched = ordered.slice(startOwner.wordIndex, endOwner.wordIndex + 1)
         const id = `${matched.map((word) => word.id).join('+')}:${cursor}`
         if (!seen.has(id)) {
           seen.add(id)
@@ -78,7 +116,7 @@ export function findMatches(
             id,
             text: matched.map((word) => word.text).join(' '),
             wordIds: matched.map((word) => word.id),
-            bbox: unionBoxes(matched),
+            bbox: partialBoundingBox(ordered, startOwner, endOwner),
           })
         }
       }
