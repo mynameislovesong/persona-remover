@@ -459,7 +459,7 @@ function App() {
                   <input
                     value={query}
                     onChange={(event) => { invalidateResults(); setQuery(event.target.value) }}
-                    placeholder="찾을 이름 (예: 히사카)"
+                    placeholder="찾을 이름 (예: 뤼붕이)"
                     aria-label="찾을 이름"
                   />
                   {query && <button type="button" onClick={() => { invalidateResults(); setQuery('') }} aria-label="검색어 지우기"><X size={16} /></button>}
