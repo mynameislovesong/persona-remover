@@ -84,7 +84,10 @@ function paddedBox(box: BoundingBox, padding: number, width: number, height: num
   return {
     x0: clamp(Math.floor(box.x0 - padding), 0, width),
     y0: clamp(Math.floor(box.y0 - padding), 0, height),
-    x1: clamp(Math.ceil(box.x1 + padding), 0, width),
+    // Candidate coordinates come back as fractions after template downscaling. Using ceil on
+    // the right edge could erase one extra source pixel and nick an attached 조사. Round to
+    // the nearest source pixel instead while keeping the left/top side conservative.
+    x1: clamp(Math.round(box.x1 + padding), 0, width),
     y1: clamp(Math.ceil(box.y1 + padding), 0, height),
   }
 }
